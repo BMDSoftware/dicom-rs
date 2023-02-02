@@ -3,7 +3,7 @@ use dicom_core::{dicom_value, header::Tag, DataElement, VR};
 use dicom_dictionary_std::{tags, uids};
 use dicom_encoding::transfer_syntax;
 use dicom_encoding::TransferSyntax;
-use dicom_object::{mem::InMemDicomObject, DefaultDicomObject, StandardDataDictionary};
+use dicom_object::{mem::InMemDicomObject, StandardDataDictionary, DefaultDicomObject, file::ReadPreamble};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use indicatif::{ProgressBar, ProgressStyle};
 use snafu::prelude::*;
@@ -22,6 +22,8 @@ mod store_async;
 mod store_sync;
 
 /// DICOM C-STORE SCU
+///
+/// Version with compressed file support.
 #[derive(Debug, Parser)]
 #[command(version)]
 struct App {
@@ -29,7 +31,7 @@ struct App {
     /// optionally with AE title
     /// (example: "STORE-SCP@127.0.0.1:104")
     addr: String,
-    /// the DICOM file(s) to store
+    /// the DICOM file(s) to store (can be .gz and .zst files)
     #[arg(required = true)]
     files: Vec<PathBuf>,
     /// verbose mode
@@ -96,9 +98,19 @@ struct App {
     concurrency: Option<usize>,
 }
 
+/// A supported lossless compression on top of the DICOM file.
+enum FileCompression {
+    /// Gzip
+    Gzip,
+    /// Zstandard
+    Zstd,
+}
+
 struct DicomFile {
     /// File path
     file: PathBuf,
+    /// whether the file is compressed
+    compression: Option<FileCompression>,
     /// Storage SOP Class UID
     sop_class_uid: String,
     /// Storage SOP Instance UID
@@ -134,6 +146,7 @@ enum Error {
     /// Error reading a file
     ReadFilePath {
         path: String,
+        #[snafu(source(from(Box<dicom_object::ReadError>, Box::from)))]
         source: Box<dicom_object::ReadError>,
     },
     /// No matching presentation contexts
@@ -161,6 +174,15 @@ enum Error {
     },
     WriteIO {
         source: std::io::Error,
+    },
+    
+    #[snafu(whatever)]
+    Other {
+        /// The error message.
+        message: String,
+        /// The underlying error cause, if any.
+        #[snafu(source(from(Box<dyn std::error::Error + Send + Sync + 'static>, Some)))]
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
 }
 
@@ -197,19 +219,24 @@ fn check_files(
     let mut dicom_files: Vec<DicomFile> = vec![];
     let mut presentation_contexts = HashSet::new();
 
+    let progress = ProgressBar::new_spinner();
+    progress.set_message("Checking files...");
     for file in files {
         if file.is_dir() {
             for file in WalkDir::new(file.as_path())
                 .into_iter()
                 .filter_map(Result::ok)
                 .filter(|f| !f.file_type().is_dir())
+                .filter(|f| f.path().extension() != Some(OsStr::new("png")))
             {
+                progress.tick();
                 checked_files.push(file.into_path());
             }
         } else {
             checked_files.push(file);
         }
     }
+    progress.finish_and_clear();
 
     for file in checked_files {
         if verbose {
@@ -239,8 +266,9 @@ fn check_files(
 
                 dicom_files.push(dicom_file);
             }
-            Err(_) => {
-                warn!("Could not open file {} as DICOM", file.display());
+            Err(e) => {
+                warn!("Ignoring file {}:", file.display());
+                warn!("\t{}", snafu::Report::from_error(e));
             }
         }
     }
@@ -549,14 +577,40 @@ fn check_file(file: &Path) -> Result<DicomFile, Error> {
     // Ignore DICOMDIR files until better support is added
     let _ = (file.file_name() != Some(OsStr::new("DICOMDIR")))
         .then_some(false)
-        .context(FileNotSupportedSnafu)?;
-    let dicom_file = dicom_object::OpenFileOptions::new()
-        .read_until(Tag(0x0001, 0x000))
-        .open_file(file)
-        .map_err(Box::from)
-        .context(ReadFilePathSnafu {
-            path: file.display().to_string(),
-        })?;
+        .whatever_context("DICOMDIR file not supported")?;
+    
+    let opt = dicom_object::OpenFileOptions::new()
+        .read_preamble(ReadPreamble::Always)
+        .read_until(Tag(0x0001, 0x000));
+
+    let (dicom_file, compression) = if file.extension() == Some(OsStr::new("zst")) {
+
+        let reader = std::fs::File::open(file)
+            .whatever_context("Could not open file for reading")?;
+        
+        let reader = zstd::Decoder::new(reader).whatever_context("could not read file as zstd")?;
+
+        let obj = opt
+            .from_reader(reader)
+            .whatever_context("Could not open DICOM file")?;
+        (obj, Some(FileCompression::Zstd))
+    } else if file.extension() == Some(OsStr::new("gz")) {
+        let reader = std::fs::File::open(file)
+            .whatever_context("Could not open file for reading")?;
+        
+        let reader = flate2::read::GzDecoder::new(reader);
+
+        let obj = opt
+            .from_reader(reader)
+            .whatever_context("Could not open DICOM file")?;
+
+        (obj, Some(FileCompression::Gzip))
+    } else {
+        let obj = opt
+            .open_file(file)
+            .whatever_context("Could not open file as DICOM")?;
+        (obj, None)
+    };
 
     let meta = dicom_file.meta();
 
@@ -570,6 +624,7 @@ fn check_file(file: &Path) -> Result<DicomFile, Error> {
         })?;
     Ok(DicomFile {
         file: file.to_path_buf(),
+        compression,
         sop_class_uid: storage_sop_class_uid.to_string(),
         sop_instance_uid: storage_sop_instance_uid.to_string(),
         file_transfer_syntax: String::from(ts.uid()),
@@ -644,6 +699,7 @@ fn into_ts(
     ts_selected: &TransferSyntax,
     verbose: bool,
 ) -> Result<DefaultDicomObject, Error> {
+
     if ts_selected.uid() != dicom_file.meta().transfer_syntax() {
         use dicom_pixeldata::Transcode;
         let mut file = dicom_file;

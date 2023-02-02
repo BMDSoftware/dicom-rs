@@ -1,8 +1,8 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, ffi::OsStr, sync::Arc};
 
 use dicom_dictionary_std::tags;
 use dicom_encoding::TransferSyntaxIndex;
-use dicom_object::{open_file, InMemDicomObject};
+use dicom_object::{InMemDicomObject, OpenFileOptions};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use dicom_ul::{
     pdu::{PDataValue, PDataValueType},
@@ -91,11 +91,39 @@ pub async fn send_file(
         .context(CreateCommandSnafu)?;
 
         let mut object_data = Vec::with_capacity(2048);
-        let dicom_file = open_file(&file.file)
-            .map_err(Box::from)
-            .context(ReadFilePathSnafu {
-                path: file.file.display().to_string(),
-            })?;
+
+        let opt = OpenFileOptions::new();
+        let dicom_file = if file.file.extension() == Some(OsStr::new("zst")) {
+            let reader = std::fs::File::open(&file.file)
+                .whatever_context("Could not open file for reading")?;
+
+            let reader =
+                zstd::Decoder::new(reader).whatever_context("could not read file as zstd")?;
+
+            opt.from_reader(reader)
+                .map_err(Box::from)
+                .context(ReadFilePathSnafu {
+                    path: file.file.display().to_string(),
+                })?
+        } else if file.file.extension() == Some(OsStr::new("gz")) {
+            let reader = std::fs::File::open(&file.file)
+                .whatever_context("Could not open file for reading")?;
+
+            let reader = flate2::read::GzDecoder::new(reader);
+
+            opt.from_reader(reader)
+                .map_err(Box::from)
+                .context(ReadFilePathSnafu {
+                    path: file.file.display().to_string(),
+                })?
+        } else {
+            opt.open_file(&file.file)
+                .map_err(Box::from)
+                .context(ReadFilePathSnafu {
+                    path: file.file.display().to_string(),
+                })?
+        };
+
         let ts_selected = TransferSyntaxRegistry
             .get(&ts_uid_selected)
             .with_context(|| UnsupportedFileTransferSyntaxSnafu {

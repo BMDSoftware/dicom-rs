@@ -613,12 +613,14 @@ dependencies = [
  "dicom-pixeldata",
  "dicom-transfer-syntax-registry",
  "dicom-ul",
+ "flate2",
  "indicatif",
  "snafu",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "walkdir",
+ "zstd",
 ]
 
 [[package]]
